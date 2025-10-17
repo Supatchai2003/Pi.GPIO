@@ -1,0 +1,167 @@
+# simple_sort.py  —  Pure-Python SORT (Kalman + Hungarian), no C/C++ build required.
+import numpy as np
+from filterpy.kalman import KalmanFilter
+from scipy.optimize import linear_sum_assignment
+
+def iou_batch(bb_test, bb_gt):
+    # bb_test: Mx4, bb_gt: Nx4  -> IoU matrix MxN
+    M = bb_test.shape[0]
+    N = bb_gt.shape[0]
+    if M == 0 or N == 0:
+        return np.zeros((M, N), dtype=np.float32)
+    xx1 = np.maximum(bb_test[:, None, 0], bb_gt[None, :, 0])
+    yy1 = np.maximum(bb_test[:, None, 1], bb_gt[None, :, 1])
+    xx2 = np.minimum(bb_test[:, None, 2], bb_gt[None, :, 2])
+    yy2 = np.minimum(bb_test[:, None, 3], bb_gt[None, :, 3])
+    w = np.maximum(0., xx2 - xx1)
+    h = np.maximum(0., yy2 - yy1)
+    inter = w * h
+    area_test = (bb_test[:, 2] - bb_test[:, 0]) * (bb_test[:, 3] - bb_test[:, 1])
+    area_gt   = (bb_gt[:, 2] - bb_gt[:, 0]) * (bb_gt[:, 3] - bb_gt[:, 1])
+    union = area_test[:, None] + area_gt[None, :] - inter
+    return inter / (union + 1e-6)
+
+def convert_bbox_to_z(bbox):
+    # [x1,y1,x2,y2] -> [cx, cy, s, r]  (s=area, r=aspect)
+    w = bbox[2] - bbox[0]
+    h = bbox[3] - bbox[1]
+    cx = bbox[0] + w / 2.0
+    cy = bbox[1] + h / 2.0
+    s = w * h
+    r = w / (h + 1e-6)
+    return np.array([cx, cy, s, r], dtype=np.float32).reshape((4, 1))
+
+def convert_x_to_bbox(x, score=None):
+    # state x -> [x1,y1,x2,y2,(score)]
+    cx, cy, s, r = x[0], x[1], x[2], x[3]
+    w = np.sqrt(s * r)
+    h = s / (w + 1e-6)
+    x1 = cx - w / 2.0
+    y1 = cy - h / 2.0
+    x2 = cx + w / 2.0
+    y2 = cy + h / 2.0
+    if score is None:
+        return np.array([x1, y1, x2, y2]).reshape((1, 4))
+    else:
+        return np.array([x1, y1, x2, y2, score]).reshape((1, 5))
+
+class KalmanBoxTracker:
+    count = 0
+    def __init__(self, bbox):
+        # 7-dim state: [cx, cy, s, r, vx, vy, vs]; r (aspect) ไม่มีความเร็ว
+        self.kf = KalmanFilter(dim_x=7, dim_z=4)
+        self.kf.F = np.array([
+            [1,0,0,0,1,0,0],
+            [0,1,0,0,0,1,0],
+            [0,0,1,0,0,0,1],
+            [0,0,0,1,0,0,0],
+            [0,0,0,0,1,0,0],
+            [0,0,0,0,0,1,0],
+            [0,0,0,0,0,0,1]
+        ], dtype=np.float32)
+        self.kf.H = np.array([
+            [1,0,0,0,0,0,0],
+            [0,1,0,0,0,0,0],
+            [0,0,1,0,0,0,0],
+            [0,0,0,1,0,0,0]
+        ], dtype=np.float32)
+        self.kf.R[2:,2:] *= 10.0
+        self.kf.P[4:,4:] *= 1000.0  # high uncertainty for velocities
+        self.kf.P *= 10.0
+        self.kf.Q[-1,-1] *= 0.01
+        self.kf.Q[4:,4:] *= 0.01
+
+        self.time_since_update = 0
+        self.id = KalmanBoxTracker.count
+        KalmanBoxTracker.count += 1
+        self.history = []
+        self.hits = 0
+        self.hit_streak = 0
+        self.age = 0
+
+        self.kf.x[:4] = convert_bbox_to_z(bbox)
+
+    def update(self, bbox):
+        # รับ measurement เป็น [x1,y1,x2,y2]
+        self.time_since_update = 0
+        self.history = []
+        self.hits += 1
+        self.hit_streak += 1
+        self.kf.update(convert_bbox_to_z(bbox))
+
+    def predict(self):
+        if (self.kf.x[6] + self.kf.x[2]) <= 0:
+            self.kf.x[6] *= 0.0
+        self.kf.predict()
+        self.age += 1
+        if self.time_since_update > 0:
+            self.hit_streak = 0
+        self.time_since_update += 1
+        self.history.append(convert_x_to_bbox(self.kf.x))
+        return self.history[-1]
+
+    def get_state(self):
+        return convert_x_to_bbox(self.kf.x)
+
+class Sort:
+    def __init__(self, max_age=15, min_hits=2, iou_threshold=0.2):
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.iou_threshold = iou_threshold
+        self.trackers = []
+
+    def update(self, dets=np.empty((0,5))):
+        # dets: Nx5 -> [x1 y1 x2 y2 score]
+        ret = []
+        # 1) predict ตำแหน่งจากทุก tracker
+        trks = np.zeros((len(self.trackers), 4))
+        to_del = []
+        for t, trk in enumerate(self.trackers):
+            pos = trk.predict()[0]
+            trks[t] = pos
+            if np.any(np.isnan(pos)):
+                to_del.append(t)
+        self.trackers = [t for i,t in enumerate(self.trackers) if i not in to_del]
+
+        # 2) จับคู่ด้วย IoU + Hungarian
+        matched, unmatched_dets, unmatched_trks = self._associate_detections_to_trackers(dets, trks)
+
+        # 3) อัปเดต matched tracker
+        for m in matched:
+            d = dets[m[0], :4]
+            self.trackers[m[1]].update(d)
+
+        # 4) สร้าง tracker ใหม่จาก unmatched dets
+        for i in unmatched_dets:
+            self.trackers.append(KalmanBoxTracker(dets[i, :4]))
+
+        # 5) รวบรวมเอาท์พุต + กำจัดอันแก่เกิน
+        i = len(self.trackers)
+        for trk in reversed(self.trackers):
+            d = trk.get_state()[0]
+            if (trk.time_since_update < 1) and (trk.hit_streak >= self.min_hits or trk.age <= self.min_hits):
+                ret.append(np.concatenate((d, [trk.id])).reshape(1,-1))
+            i -= 1
+            if trk.time_since_update > self.max_age:
+                self.trackers.pop(i)
+        if len(ret) == 0:
+            return np.empty((0,5))
+        return np.concatenate(ret)
+
+    def _associate_detections_to_trackers(self, dets, trks):
+        if trks.shape[0] == 0 or dets.shape[0] == 0:
+            return np.empty((0,2), dtype=int), np.arange(dets.shape[0]), np.arange(trks.shape[0])
+
+        iou_mat = iou_batch(dets[:, :4], trks)
+        row_ind, col_ind = linear_sum_assignment(-iou_mat)  # maximize IoU
+        matches = []
+        for r, c in zip(row_ind, col_ind):
+            if iou_mat[r, c] >= self.iou_threshold:
+                matches.append([r, c])
+        matches = np.array(matches, dtype=int)
+
+        matched_dets = matches[:, 0] if matches.size else np.array([], dtype=int)
+        matched_trks = matches[:, 1] if matches.size else np.array([], dtype=int)
+        unmatched_dets = np.setdiff1d(np.arange(dets.shape[0]), matched_dets)
+        unmatched_trks = np.setdiff1d(np.arange(trks.shape[0]), matched_trks)
+        return matches, unmatched_dets, unmatched_trks
